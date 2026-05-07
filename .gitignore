@@ -1,6 +1,7 @@
 # Go binaries and build artifacts
 main
 bootstrap
+out/
 *.exe
 *.dll
 *.so

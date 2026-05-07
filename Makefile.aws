@@ -67,9 +67,10 @@ upload-certs: check-deps
 
 build:
 	@echo "Building Lambda function..."
-	GOOS=linux GOARCH=amd64 go build -o bootstrap main.go
-	zip lambda-function.zip bootstrap
-	@echo "✓ Lambda function built"
+	@mkdir -p out
+	GOOS=linux GOARCH=amd64 go build -o out/bootstrap main.go
+	cd out && zip ../lambda-function.zip bootstrap
+	@echo "✓ Lambda function built (binary: out/bootstrap, zip: lambda-function.zip)"
 
 create-secrets: check-deps
 	@echo "Creating Secrets Manager secrets..."
@@ -264,3 +265,4 @@ destroy: check-deps
 # Clean up build artifacts
 clean:
 	rm -f bootstrap lambda-function.zip
+	rm -rf out/
