@@ -51,12 +51,6 @@ type IruResponse struct {
 	Results []IruDevice `json:"results"`
 }
 
-// OktaWorkflowRequest represents the request to Okta Workflow
-type OktaWorkflowRequest struct {
-	UserEmail    string `json:"userEmail"`
-	SerialNumber string `json:"serialNumber"`
-	DeviceID     string `json:"deviceId"`
-}
 
 // OktaWorkflowResponse represents the response from Okta Workflow
 type OktaWorkflowResponse struct {
@@ -274,26 +268,12 @@ func getTACFromOktaWorkflow(userEmail, serialNumber, deviceID string) (*Workflow
 
 	log.Printf("Calling workflow URL: %s", workflowURL.String())
 
-	// Prepare the request payload
-	payload := OktaWorkflowRequest{
-		UserEmail:    userEmail,
-		SerialNumber: serialNumber,
-		DeviceID:     deviceID,
-	}
-
-	payloadBytes, err := json.Marshal(payload)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	log.Printf("Sending to Okta Workflow: %s", string(payloadBytes))
-
-	req, err := http.NewRequest("POST", workflowURL.String(), strings.NewReader(string(payloadBytes)))
+	// Create GET request with email query parameter (no JSON payload needed)
+	req, err := http.NewRequest("GET", workflowURL.String(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 
 	client := &http.Client{}
