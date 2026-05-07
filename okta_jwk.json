@@ -1,7 +1,0 @@
-{
-    "kty": "RSA",
-    "use": "sig",
-    "kid": "pcxp6cTgrsiWcrFCMsw9i7BfXbKMj7Lh62FKxLw68cI",
-    "n": "wHTzMELWec1ilg3K6wADRc9rWfFadRXZAIHzRih6A_BFfUPzUFOPEy5uUPJtYjYvqoqVMB3whzWU6cyPM_66PTQGwiE-UNIh1ip1rkOQO5YiSS2_xm0fWyXqq9-pdLkXzKT57870mVqHgwpfSbKkOYSBfzucvbuR78HQxREXV5TFfiYulz6nzMg2YRDcrkVuYI0Swd1nprjmPefw5DnSCn0mZBR80vGYR1wKLm8JUOmZ6gSL45beeeNbA1rjTxkDcI_zGF3J6c1Bp66Y7tSSdrFjEuCKCcpt5gU3LQq1TDCqyTJlAwA0SKAoK6DWUkELLJjl0UEVfRZ2K_nXsknHxw",
-    "e": "AQAB"
-}
