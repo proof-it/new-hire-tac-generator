@@ -1,0 +1,56 @@
+# Go binaries and build artifacts
+main
+bootstrap
+*.exe
+*.dll
+*.so
+*.dylib
+*.zip
+lambda-function.zip
+
+# Go test files
+*.test
+*.out
+go.work
+
+# Terraform files
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+terraform.tfvars
+lambda_function.zip
+
+# Certificates and keys - NEVER COMMIT THESE
+*.key
+*.crt
+*.pem
+*.p12
+*.pfx
+okta_private_key*
+okta_ca_cert*
+okta_public_key*
+*.jwk
+*_private_key*
+*secret*
+*credential*
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment variables and config
+.env
+.env.*
+config.env
+lambda-env-update.json
+test-event.json
+
+# Logs
+*.log

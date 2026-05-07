@@ -1,0 +1,266 @@
+# AWS CLI-based deployment for New Hire TAC Generator
+
+# Configuration variables
+PROJECT_NAME ?= new-hire-tac
+AWS_REGION ?= us-east-1
+LAMBDA_FUNCTION_NAME = $(PROJECT_NAME)-generator
+OKTA_SECRET_NAME = $(PROJECT_NAME)/okta-private-key
+IRU_SECRET_NAME = $(PROJECT_NAME)/iru-api-token
+VPC_ID ?= vpc-0e0009793d14d0b5c
+SUBNET_IDS ?= $(shell aws ec2 describe-subnets --filters "Name=vpc-id,Values=$(VPC_ID)" --query "Subnets[*].SubnetId" --output text --region $(AWS_REGION))
+
+# Certificate ARNs (must be set)
+SSL_CERT_ARN ?= arn:aws:acm:us-east-1:913807247959:certificate/5820aca5-079a-4a3f-aee2-26a2b83ad0f6
+CA_CERT_ARN ?=
+
+# API configuration
+IRU_API_URL ?= https://proof.api.kandji.io
+IRU_API_TOKEN ?=
+OKTA_DOMAIN ?= proof.okta.com
+OKTA_CLIENT_ID ?= 0oa12qgvzx92ZbuKt698
+OKTA_WORKFLOW_URL ?=
+
+.PHONY: all build deploy destroy help check-deps check-config upload-certs
+
+help:
+	@echo "Available targets:"
+	@echo "  check-deps      - Check required dependencies"
+	@echo "  check-config    - Validate required configuration"
+	@echo "  upload-certs    - Upload CA certificate to ACM"
+	@echo "  build          - Build the Lambda function"
+	@echo "  create-secrets - Create Secrets Manager secrets"
+	@echo "  create-role    - Create IAM role for Lambda"
+	@echo "  create-lambda  - Create Lambda function"
+	@echo "  create-sg      - Create security group for ALB"
+	@echo "  create-alb     - Create Application Load Balancer"
+	@echo "  deploy         - Full deployment (all components)"
+	@echo "  update-lambda  - Update Lambda function code"
+	@echo "  destroy        - Clean up all resources"
+
+check-deps:
+	@which aws >/dev/null || (echo "AWS CLI not found. Please install it." && exit 1)
+	@which jq >/dev/null || (echo "jq not found. Please install it." && exit 1)
+	@which go >/dev/null || (echo "Go not found. Please install it." && exit 1)
+	@echo "✓ All dependencies found"
+
+check-config:
+	@test -n "$(SSL_CERT_ARN)" || (echo "SSL_CERT_ARN must be set" && exit 1)
+	@test -n "$(OKTA_DOMAIN)" || (echo "OKTA_DOMAIN must be set" && exit 1)
+	@test -n "$(OKTA_CLIENT_ID)" || (echo "OKTA_CLIENT_ID must be set" && exit 1)
+	@test -n "$(OKTA_WORKFLOW_URL)" || (echo "OKTA_WORKFLOW_URL must be set" && exit 1)
+	@test -f "okta_private_key.pem" || (echo "okta_private_key.pem not found. Run 'make generate-keys' first." && exit 1)
+	@echo "✓ Configuration validated"
+
+upload-certs: check-deps
+	@echo "Uploading CA certificate to ACM..."
+	@test -f "okta_ca_cert.pem" || (echo "okta_ca_cert.pem not found" && exit 1)
+	@CA_ARN=$$(aws acm import-certificate \
+		--certificate fileb://okta_ca_cert.pem \
+		--region $(AWS_REGION) \
+		--query 'CertificateArn' \
+		--output text 2>/dev/null); \
+	echo "CA Certificate ARN: $$CA_ARN"; \
+	echo "Add this to your config.env:"; \
+	echo "export CA_CERT_ARN=$$CA_ARN"
+	@echo ""
+	@echo "Note: You'll also need to upload your server SSL certificate separately"
+
+build:
+	@echo "Building Lambda function..."
+	GOOS=linux GOARCH=amd64 go build -o bootstrap main.go
+	zip lambda-function.zip bootstrap
+	@echo "✓ Lambda function built"
+
+create-secrets: check-deps
+	@echo "Creating Secrets Manager secrets..."
+	@aws secretsmanager create-secret \
+		--name $(OKTA_SECRET_NAME) \
+		--description "Private key for Okta OAuth integration" \
+		--secret-string file://okta_private_key.pem \
+		--region $(AWS_REGION) \
+		2>/dev/null || echo "Okta secret may already exist"
+	@echo "✓ Okta secret created: $(OKTA_SECRET_NAME)"
+
+	@echo "Enter your Iru API token:"
+	@read -s IRU_TOKEN && \
+	aws secretsmanager create-secret \
+		--name $(IRU_SECRET_NAME) \
+		--description "API token for Iru MDM integration" \
+		--secret-string "$$IRU_TOKEN" \
+		--region $(AWS_REGION) \
+		2>/dev/null || echo "Iru secret may already exist"
+	@echo "✓ Iru secret created: $(IRU_SECRET_NAME)"
+
+create-role: check-deps
+	@echo "Creating IAM role for Lambda..."
+	@aws iam create-role \
+		--role-name $(PROJECT_NAME)-lambda-role \
+		--assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}' \
+		2>/dev/null || echo "Role may already exist"
+
+	@aws iam attach-role-policy \
+		--role-name $(PROJECT_NAME)-lambda-role \
+		--policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole \
+		2>/dev/null || true
+
+	@aws iam put-role-policy \
+		--role-name $(PROJECT_NAME)-lambda-role \
+		--policy-name SecretsManagerPolicy \
+		--policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["secretsmanager:GetSecretValue"],"Resource":["arn:aws:secretsmanager:$(AWS_REGION):*:secret:$(OKTA_SECRET_NAME)*","arn:aws:secretsmanager:$(AWS_REGION):*:secret:$(IRU_SECRET_NAME)*"]}]}' \
+		2>/dev/null || true
+
+	@echo "Waiting for role to propagate..."
+	@sleep 10
+	@echo "✓ IAM role created: $(PROJECT_NAME)-lambda-role"
+
+create-lambda: check-deps check-config build create-role create-secrets
+	@echo "Creating Lambda function..."
+	@echo '{"Variables":{"IRU_API_URL":"$(IRU_API_URL)","IRU_API_TOKEN_SECRET_NAME":"$(IRU_SECRET_NAME)","OKTA_DOMAIN":"$(OKTA_DOMAIN)","OKTA_CLIENT_ID":"$(OKTA_CLIENT_ID)","OKTA_WORKFLOW_URL":"$(OKTA_WORKFLOW_URL)","OKTA_PRIVATE_KEY_SECRET_NAME":"$(OKTA_SECRET_NAME)"}}' > lambda-env.json
+	@ROLE_ARN=$$(aws iam get-role --role-name $(PROJECT_NAME)-lambda-role --query 'Role.Arn' --output text --region $(AWS_REGION)); \
+	echo "Using role: $$ROLE_ARN"; \
+	aws lambda create-function \
+		--function-name $(LAMBDA_FUNCTION_NAME) \
+		--runtime provided.al2 \
+		--role "$$ROLE_ARN" \
+		--handler bootstrap \
+		--zip-file fileb://lambda-function.zip \
+		--environment file://lambda-env.json \
+		--timeout 30 \
+		--region $(AWS_REGION) || (echo "Failed to create Lambda function" && exit 1)
+	@rm -f lambda-env.json
+	@echo "✓ Lambda function created: $(LAMBDA_FUNCTION_NAME)"
+
+create-sg: check-deps
+	@echo "Creating security group for ALB..."
+	@aws ec2 create-security-group \
+		--group-name $(PROJECT_NAME)-alb-sg \
+		--description "Security group for $(PROJECT_NAME) ALB" \
+		--vpc-id $(VPC_ID) \
+		--region $(AWS_REGION) \
+		2>/dev/null || echo "Security group may already exist"
+
+	@SG_ID=$$(aws ec2 describe-security-groups --filters "Name=group-name,Values=$(PROJECT_NAME)-alb-sg" --query "SecurityGroups[0].GroupId" --output text --region $(AWS_REGION)); \
+	aws ec2 authorize-security-group-ingress \
+		--group-id $$SG_ID \
+		--protocol tcp \
+		--port 443 \
+		--cidr 0.0.0.0/0 \
+		--region $(AWS_REGION) \
+		2>/dev/null || true
+	@echo "✓ Security group created: $(PROJECT_NAME)-alb-sg"
+
+create-target-group: check-deps create-lambda
+	@echo "Creating target group..."
+	@aws elbv2 create-target-group \
+		--name $(PROJECT_NAME)-lambda-tg \
+		--target-type lambda \
+		--region $(AWS_REGION) \
+		2>/dev/null || echo "Target group may already exist"
+
+	@echo "Waiting for Lambda function to be ready..."
+	@sleep 5
+	@TG_ARN=$$(aws elbv2 describe-target-groups --names $(PROJECT_NAME)-lambda-tg --query "TargetGroups[0].TargetGroupArn" --output text --region $(AWS_REGION)); \
+	LAMBDA_ARN=$$(aws lambda get-function --function-name $(LAMBDA_FUNCTION_NAME) --query "Configuration.FunctionArn" --output text --region $(AWS_REGION)); \
+	echo "Registering Lambda $$LAMBDA_ARN with target group $$TG_ARN"; \
+	aws elbv2 register-targets \
+		--target-group-arn $$TG_ARN \
+		--targets Id=$$LAMBDA_ARN \
+		--region $(AWS_REGION) || echo "Target registration failed"
+
+	@LAMBDA_ARN=$$(aws lambda get-function --function-name $(LAMBDA_FUNCTION_NAME) --query "Configuration.FunctionArn" --output text --region $(AWS_REGION)); \
+	echo "Adding ALB permission for Lambda function"; \
+	aws lambda add-permission \
+		--function-name $(LAMBDA_FUNCTION_NAME) \
+		--statement-id AllowExecutionFromALB \
+		--action lambda:InvokeFunction \
+		--principal elasticloadbalancing.amazonaws.com \
+		--source-arn $$LAMBDA_ARN \
+		--region $(AWS_REGION) \
+		2>/dev/null || echo "Permission may already exist"
+	@echo "✓ Target group created and configured"
+
+create-alb: check-deps check-config create-sg create-target-group
+	@echo "Creating Application Load Balancer..."
+	@SG_ID=$$(aws ec2 describe-security-groups --filters "Name=group-name,Values=$(PROJECT_NAME)-alb-sg" --query "SecurityGroups[0].GroupId" --output text --region $(AWS_REGION)); \
+	aws elbv2 create-load-balancer \
+		--name $(PROJECT_NAME)-alb \
+		--subnets $(SUBNET_IDS) \
+		--security-groups $$SG_ID \
+		--scheme internet-facing \
+		--type application \
+		--region $(AWS_REGION) \
+		2>/dev/null || echo "Load balancer may already exist"
+
+	@echo "Creating HTTPS listener with mTLS..."
+	@ALB_ARN=$$(aws elbv2 describe-load-balancers --names $(PROJECT_NAME)-alb --query "LoadBalancers[0].LoadBalancerArn" --output text --region $(AWS_REGION)); \
+	TG_ARN=$$(aws elbv2 describe-target-groups --names $(PROJECT_NAME)-lambda-tg --query "TargetGroups[0].TargetGroupArn" --output text --region $(AWS_REGION)); \
+	aws elbv2 create-listener \
+		--load-balancer-arn $$ALB_ARN \
+		--protocol HTTPS \
+		--port 443 \
+		--certificates CertificateArn=$(SSL_CERT_ARN) \
+		--ssl-policy ELBSecurityPolicy-TLS-1-2-2017-01 \
+		--default-actions Type=forward,TargetGroupArn=$$TG_ARN \
+		--region $(AWS_REGION) \
+		2>/dev/null || echo "Listener may already exist"
+
+	@ALB_DNS=$$(aws elbv2 describe-load-balancers --names $(PROJECT_NAME)-alb --query "LoadBalancers[0].DNSName" --output text --region $(AWS_REGION)); \
+	echo "✓ ALB created. DNS: $$ALB_DNS"
+	@echo "Note: You need to configure mTLS manually in the AWS Console"
+	@echo "      Go to EC2 → Load Balancers → $(PROJECT_NAME)-alb → Listeners → Edit"
+	@echo "      Add client certificate verification using CA ARN: $(CA_CERT_ARN)"
+
+update-lambda: check-deps build
+	@echo "Updating Lambda function code..."
+	@aws lambda update-function-code \
+		--function-name $(LAMBDA_FUNCTION_NAME) \
+		--zip-file fileb://lambda-function.zip \
+		--region $(AWS_REGION)
+	@echo "✓ Lambda function updated"
+
+deploy: check-deps check-config create-secrets create-lambda create-alb
+	@echo "🚀 Deployment complete!"
+	@ALB_DNS=$$(aws elbv2 describe-load-balancers --names $(PROJECT_NAME)-alb --query "LoadBalancers[0].DNSName" --output text --region $(AWS_REGION) 2>/dev/null || echo "ALB not found"); \
+	echo "ALB DNS: $$ALB_DNS"
+	@echo ""
+	@echo "Next steps:"
+	@echo "1. Configure mTLS on the ALB listener (see note above)"
+	@echo "2. Point your domain to the ALB"
+	@echo "3. Test with: curl --cert client.crt --key client.key --cacert ca.crt https://your-domain/"
+
+destroy: check-deps
+	@echo "Destroying resources..."
+	@echo "Deleting ALB..."
+	@ALB_ARN=$$(aws elbv2 describe-load-balancers --names $(PROJECT_NAME)-alb --query "LoadBalancers[0].LoadBalancerArn" --output text --region $(AWS_REGION) 2>/dev/null); \
+	if [ "$$ALB_ARN" != "None" ] && [ -n "$$ALB_ARN" ]; then \
+		aws elbv2 delete-load-balancer --load-balancer-arn $$ALB_ARN --region $(AWS_REGION); \
+	fi
+
+	@echo "Deleting target group..."
+	@TG_ARN=$$(aws elbv2 describe-target-groups --names $(PROJECT_NAME)-lambda-tg --query "TargetGroups[0].TargetGroupArn" --output text --region $(AWS_REGION) 2>/dev/null); \
+	if [ "$$TG_ARN" != "None" ] && [ -n "$$TG_ARN" ]; then \
+		aws elbv2 delete-target-group --target-group-arn $$TG_ARN --region $(AWS_REGION); \
+	fi
+
+	@echo "Deleting Lambda function..."
+	@aws lambda delete-function --function-name $(LAMBDA_FUNCTION_NAME) --region $(AWS_REGION) 2>/dev/null || true
+
+	@echo "Deleting security group..."
+	@SG_ID=$$(aws ec2 describe-security-groups --filters "Name=group-name,Values=$(PROJECT_NAME)-alb-sg" --query "SecurityGroups[0].GroupId" --output text --region $(AWS_REGION) 2>/dev/null); \
+	if [ "$$SG_ID" != "None" ] && [ -n "$$SG_ID" ]; then \
+		aws ec2 delete-security-group --group-id $$SG_ID --region $(AWS_REGION); \
+	fi
+
+	@echo "Deleting IAM role..."
+	@aws iam detach-role-policy --role-name $(PROJECT_NAME)-lambda-role --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole 2>/dev/null || true
+	@aws iam delete-role-policy --role-name $(PROJECT_NAME)-lambda-role --policy-name SecretsManagerPolicy 2>/dev/null || true
+	@aws iam delete-role --role-name $(PROJECT_NAME)-lambda-role 2>/dev/null || true
+
+	@echo "Deleting secret..."
+	@aws secretsmanager delete-secret --secret-id $(SECRET_NAME) --force-delete-without-recovery --region $(AWS_REGION) 2>/dev/null || true
+
+	@echo "✓ Resources destroyed"
+
+# Clean up build artifacts
+clean:
+	rm -f bootstrap lambda-function.zip
