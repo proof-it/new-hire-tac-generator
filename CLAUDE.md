@@ -5,6 +5,7 @@ This document provides technical context and implementation details for future C
 ## Project Overview
 
 **Purpose**: Generate Temporary Access Codes (TACs) for new hires using mTLS device authentication
+**Integration**: Called via custom script in iru-content during laptop setup process
 **Architecture**: AWS ALB + Lambda + Go + mTLS + OAuth 2.0 + MDM/Workflow APIs
 **Target User**: john.heasman@proof.com (primary test user)
 
@@ -61,6 +62,30 @@ func getTACFromOktaWorkflow(userEmail, serialNumber, deviceID string) (string, e
 - **Response Handling**: Supports both plain text TAC and JSON responses
 - **Error Recovery**: Detailed logging of workflow errors
 
+## Business Logic & Workflow Safeguards
+
+The Okta Workflow implements strict eligibility requirements:
+
+### 1. **Admin Check**
+- User must **NOT** be a Super Admin in Okta
+- Prevents privileged users from bypassing security controls
+
+### 2. **Group Membership**
+- User must be in the `Users: Device Bootstrap` group
+- **Critical**: This group is cleared nightly
+- Provides time-limited access window for device setup
+
+### 3. **New Hire Validation**
+- User must be a recent hire: `now() - employmentDate <= 7 days`
+- `employmentDate` is an Okta profile attribute
+- Start date cannot be in the future (`>= 0 days`)
+- Prevents TAC generation for existing employees
+
+### 4. **Implementation Notes**
+- These checks happen in the Okta Workflow, not the Lambda function
+- Lambda receives either a TAC or "User not eligible" response
+- Business logic changes should be made in the workflow, not code
+
 ## Critical Configuration
 
 ### Environment Variables
@@ -74,6 +99,10 @@ func getTACFromOktaWorkflow(userEmail, serialNumber, deviceID string) (string, e
   "OKTA_PRIVATE_KEY_SECRET_NAME": "new-hire-tac/okta-private-key"
 }
 ```
+
+**Key Notes**:
+- `OKTA_WORKFLOW_URL` comes from the Okta Workflow "API Endpoint" card
+- `OKTA_PRIVATE_KEY_SECRET_NAME` should match the actual secret name in AWS Secrets Manager
 
 ### AWS Resources
 - **Lambda Function**: `new-hire-tac-generator` (us-east-1)
@@ -150,12 +179,20 @@ func getSecretValue(secretName string) (string, error)
 
 ### 1. Code Changes
 ```bash
-# Build and deploy
+# Build (creates out/bootstrap binary)
+make -f Makefile.aws build
+
+# Deploy updated Lambda function
 make -f Makefile.aws update-lambda
 
 # Test immediately  
 CURL_SSL_BACKEND=secure-transport /usr/bin/curl --cert "OktaManagementAttestation for DMV6JNFCCP" https://tac.it.proof.com
 ```
+
+### 2. Build Process
+- **Binary Output**: `out/bootstrap` (keeps root directory clean)
+- **Deployment Package**: `lambda-function.zip` (root directory for AWS CLI compatibility)
+- **Clean**: `make -f Makefile.aws clean` removes both binary and zip
 
 ### 2. Environment Updates
 ```bash
@@ -176,31 +213,41 @@ aws lambda invoke --function-name new-hire-tac-generator --payload fileb://test-
 
 ## Historical Context & Lessons Learned
 
-### 1. Certificate Header Discovery
+### 1. **Integration Context**
+- **Purpose**: System is called by iru-content script during laptop setup
+- **Workflow**: Device → Certificate → TAC → Device Bootstrap
+- **Scope**: Focused on new hire onboarding automation
+
+### 2. Certificate Header Discovery
 - **Initial assumption**: ALB would use `x-forwarded-client-cert`
 - **Reality**: ALB uses `x-amzn-mtls-clientcert-subject`
 - **Impact**: Required code change to read correct header
 
-### 2. Iru API Response Format
+### 3. Iru API Response Format
 - **Initial assumption**: Response wrapped in `{count, results}` object
 - **Reality**: Direct array response `[{device1}, {device2}]`
 - **Impact**: Simplified JSON parsing logic
 
-### 3. OAuth Scope Evolution
+### 4. OAuth Scope Evolution
 - **Progression**: `invalid_scope` → `consent_required` → `no_org_scopes_granted` → success
 - **Solution**: User granted `okta.workflows.invoke.manage` scope manually
 - **Current**: Scope must be explicitly requested in token request
 
-### 4. Workflow Parameter Format
+### 5. Workflow Parameter Format
 - **Issue**: Initial 405 errors due to placeholder URL
 - **Issue**: 500 errors due to missing email query parameter
 - **Solution**: Email must be passed as `?email=user@domain.com` query parameter
 - **Current**: Both query parameter and JSON payload required
 
-### 5. Response Format Flexibility
+### 6. Response Format Flexibility
 - **Evolution**: JSON-only → JSON + plain text support
 - **Driver**: Workflow team simplified response format
 - **Implementation**: Try JSON decode first, fallback to plain text
+
+### 7. Business Logic Implementation
+- **Discovery**: Workflow handles all eligibility logic (Admin check, group membership, hire date)
+- **Architecture**: Lambda focuses on technical integration, Workflow handles business rules
+- **Benefit**: Business logic changes don't require code deployment
 
 ## Security Model
 
