@@ -83,6 +83,14 @@ type JWTClaims struct {
 	jwt.RegisteredClaims
 }
 
+// WorkflowResult represents the result from calling the Okta Workflow
+type WorkflowResult struct {
+	TAC        string
+	StatusCode int
+	Message    string
+	Success    bool
+}
+
 func main() {
 	lambda.Start(handleRequest)
 }
@@ -130,13 +138,19 @@ func handleRequest(ctx context.Context, request events.ALBTargetGroupRequest) (e
 	log.Printf("Found device assigned to: %s (%s)", device.User.Name, device.User.Email)
 
 	// 2. Call Okta Workflow to check eligibility and get TAC
-	tac, err := getTACFromOktaWorkflow(device.User.Email, serialNumber, device.DeviceID)
+	result, err := getTACFromOktaWorkflow(device.User.Email, serialNumber, device.DeviceID)
 	if err != nil {
-		log.Printf("Error getting TAC from Okta Workflow: %v", err)
-		return createErrorResponse(500, "Error checking eligibility"), nil
+		log.Printf("Error calling Okta Workflow: %v", err)
+		return createErrorResponse(500, "Error calling workflow"), nil
 	}
 
-	if tac == "" {
+	if !result.Success {
+		// Return the same status code and message from the workflow
+		log.Printf("Workflow returned error %d: %s", result.StatusCode, result.Message)
+		return createErrorResponse(result.StatusCode, result.Message), nil
+	}
+
+	if result.TAC == "" {
 		return createErrorResponse(403, "User not eligible for TAC"), nil
 	}
 
@@ -146,7 +160,7 @@ func handleRequest(ctx context.Context, request events.ALBTargetGroupRequest) (e
 		Headers: map[string]string{
 			"Content-Type": "text/plain",
 		},
-		Body: tac,
+		Body: result.TAC,
 	}, nil
 }
 
@@ -236,22 +250,22 @@ func getDeviceFromIru(serialNumber string) (*IruDevice, error) {
 	return &devices[0], nil
 }
 
-func getTACFromOktaWorkflow(userEmail, serialNumber, deviceID string) (string, error) {
+func getTACFromOktaWorkflow(userEmail, serialNumber, deviceID string) (*WorkflowResult, error) {
 	// Get OAuth access token first
 	accessToken, err := getOktaAccessToken()
 	if err != nil {
-		return "", fmt.Errorf("failed to get OAuth access token: %w", err)
+		return nil, fmt.Errorf("failed to get OAuth access token: %w", err)
 	}
 
 	oktaWorkflowURL := os.Getenv("OKTA_WORKFLOW_URL")
 	if oktaWorkflowURL == "" {
-		return "", fmt.Errorf("missing Okta Workflow URL")
+		return nil, fmt.Errorf("missing Okta Workflow URL")
 	}
 
 	// Add email as query parameter
 	workflowURL, err := url.Parse(oktaWorkflowURL)
 	if err != nil {
-		return "", fmt.Errorf("failed to parse workflow URL: %w", err)
+		return nil, fmt.Errorf("failed to parse workflow URL: %w", err)
 	}
 
 	query := workflowURL.Query()
@@ -269,14 +283,14 @@ func getTACFromOktaWorkflow(userEmail, serialNumber, deviceID string) (string, e
 
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal request: %w", err)
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
 	log.Printf("Sending to Okta Workflow: %s", string(payloadBytes))
 
 	req, err := http.NewRequest("POST", workflowURL.String(), strings.NewReader(string(payloadBytes)))
 	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
+		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -285,24 +299,27 @@ func getTACFromOktaWorkflow(userEmail, serialNumber, deviceID string) (string, e
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("failed to call Okta Workflow: %w", err)
+		return nil, fmt.Errorf("failed to call Okta Workflow: %w", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		// Read the error response body for debugging
-		body, _ := io.ReadAll(resp.Body)
-		log.Printf("Okta Workflow error %d: %s", resp.StatusCode, string(body))
-		return "", fmt.Errorf("Okta Workflow returned status %d: %s", resp.StatusCode, string(body))
-	}
-
-	// Read the entire response body
+	// Read the response body first
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("failed to read Okta response body: %w", err)
+		return nil, fmt.Errorf("failed to read Okta response body: %w", err)
 	}
 
-	log.Printf("Okta Workflow response: %s", string(body))
+	log.Printf("Okta Workflow response %d: %s", resp.StatusCode, string(body))
+
+	if resp.StatusCode != http.StatusOK {
+		// Return the workflow's status code and message
+		return &WorkflowResult{
+			TAC:        "",
+			StatusCode: resp.StatusCode,
+			Message:    strings.TrimSpace(string(body)),
+			Success:    false,
+		}, nil
+	}
 
 	// Try to decode as JSON first
 	var oktaResp OktaWorkflowResponse
@@ -310,19 +327,39 @@ func getTACFromOktaWorkflow(userEmail, serialNumber, deviceID string) (string, e
 		// If JSON decode fails, treat response as plain text TAC
 		tac := strings.TrimSpace(string(body))
 		if tac == "" {
-			return "", fmt.Errorf("empty response from workflow")
+			return &WorkflowResult{
+				TAC:        "",
+				StatusCode: resp.StatusCode,
+				Message:    "Empty response from workflow",
+				Success:    false,
+			}, nil
 		}
 		log.Printf("Workflow returned plain text TAC: %s", tac)
-		return tac, nil
+		return &WorkflowResult{
+			TAC:        tac,
+			StatusCode: resp.StatusCode,
+			Message:    "",
+			Success:    true,
+		}, nil
 	}
 
 	// JSON response - check eligibility
 	if !oktaResp.Eligible {
 		log.Printf("User %s not eligible: %s", userEmail, oktaResp.Message)
-		return "", nil
+		return &WorkflowResult{
+			TAC:        "",
+			StatusCode: resp.StatusCode,
+			Message:    oktaResp.Message,
+			Success:    false,
+		}, nil
 	}
 
-	return oktaResp.TAC, nil
+	return &WorkflowResult{
+		TAC:        oktaResp.TAC,
+		StatusCode: resp.StatusCode,
+		Message:    oktaResp.Message,
+		Success:    true,
+	}, nil
 }
 
 func getOktaAccessToken() (string, error) {
