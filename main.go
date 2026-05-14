@@ -36,6 +36,7 @@ type IruDevice struct {
 	Platform        string `json:"platform"`
 	Model           string `json:"model"`
 	ModelIdentifier string `json:"model_identifier"`
+	LastEnrollment  string `json:"last_enrollment"`
 }
 
 // IruUser represents user assignment information
@@ -131,6 +132,12 @@ func handleRequest(ctx context.Context, request events.ALBTargetGroupRequest) (e
 
 	log.Printf("Found device assigned to: %s (%s)", device.User.Name, device.User.Email)
 
+	// Check that the device was enrolled within the last 2 hours
+	if err := checkRecentEnrollment(device.LastEnrollment); err != nil {
+		log.Printf("Device enrollment check failed: %v", err)
+		return createErrorResponse(403, err.Error()), nil
+	}
+
 	// 2. Call Okta Workflow to check eligibility and get TAC
 	result, err := getTACFromOktaWorkflow(device.User.Email, serialNumber, device.DeviceID)
 	if err != nil {
@@ -156,6 +163,27 @@ func handleRequest(ctx context.Context, request events.ALBTargetGroupRequest) (e
 		},
 		Body: result.TAC,
 	}, nil
+}
+
+func checkRecentEnrollment(lastEnrollment string) error {
+	if lastEnrollment == "" {
+		return fmt.Errorf("device has no enrollment date")
+	}
+
+	// Parse Iru date format: "2021-03-29 21:46:13.552931+00:00"
+	enrolledAt, err := time.Parse("2006-01-02 15:04:05.999999-07:00", lastEnrollment)
+	if err != nil {
+		return fmt.Errorf("failed to parse enrollment date %q: %w", lastEnrollment, err)
+	}
+
+	age := time.Since(enrolledAt)
+	log.Printf("Device last enrolled at %s (%.1f minutes ago)", enrolledAt, age.Minutes())
+
+	if age > 2*time.Hour {
+		return fmt.Errorf("device enrollment is too old (enrolled %s)", enrolledAt.Format(time.RFC3339))
+	}
+
+	return nil
 }
 
 func extractSerialFromClientCert(certSubject string) (string, error) {
