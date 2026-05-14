@@ -142,12 +142,6 @@ func handleRequest(ctx context.Context, request events.ALBTargetGroupRequest) (e
 
 	log.Printf("Found device assigned to: %s (%s)", device.User.Name, device.User.Email)
 
-	// Check that the device was enrolled within the last 2 hours
-	if err := checkRecentEnrollment(device.LastEnrollment); err != nil {
-		log.Printf("Device enrollment check failed: %v", err)
-		return createErrorResponse(403, err.Error()), nil
-	}
-
 	// Verify the device was auto-enrolled via ADE (calls device details endpoint)
 	details, err := getDeviceDetailsFromIru(device.DeviceID)
 	if err != nil {
@@ -158,6 +152,12 @@ func handleRequest(ctx context.Context, request events.ALBTargetGroupRequest) (e
 	if details.AutomatedDeviceEnrollment == nil || !details.AutomatedDeviceEnrollment.AutoEnrolled {
 		log.Printf("Device %s is not auto-enrolled via ADE", device.DeviceID)
 		return createErrorResponse(403, "Device not auto-enrolled via ADE"), nil
+	}
+
+	// Check that the device was enrolled within the last 2 hours
+	if err := checkRecentEnrollment(device.LastEnrollment); err != nil {
+		log.Printf("Device enrollment check failed: %v", err)
+		return createErrorResponse(403, err.Error()), nil
 	}
 
 	// 2. Call Okta Workflow to check eligibility and get TAC
