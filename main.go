@@ -39,6 +39,16 @@ type IruDevice struct {
 	LastEnrollment  string `json:"last_enrollment"`
 }
 
+// IruDeviceDetails represents the response from the device details endpoint
+type IruDeviceDetails struct {
+	AutomatedDeviceEnrollment *AutomatedDeviceEnrollment `json:"automated_device_enrollment"`
+}
+
+// AutomatedDeviceEnrollment represents ADE info for a device
+type AutomatedDeviceEnrollment struct {
+	AutoEnrolled bool `json:"auto_enrolled"`
+}
+
 // IruUser represents user assignment information
 type IruUser struct {
 	ID       string `json:"id"`
@@ -131,6 +141,18 @@ func handleRequest(ctx context.Context, request events.ALBTargetGroupRequest) (e
 	}
 
 	log.Printf("Found device assigned to: %s (%s)", device.User.Name, device.User.Email)
+
+	// Verify the device was auto-enrolled via ADE (calls device details endpoint)
+	details, err := getDeviceDetailsFromIru(device.DeviceID)
+	if err != nil {
+		log.Printf("Error getting device details from Iru: %v", err)
+		return createErrorResponse(500, "Error looking up device details"), nil
+	}
+
+	if details.AutomatedDeviceEnrollment == nil || !details.AutomatedDeviceEnrollment.AutoEnrolled {
+		log.Printf("Device %s is not auto-enrolled via ADE", device.DeviceID)
+		return createErrorResponse(403, "Device not auto-enrolled via ADE"), nil
+	}
 
 	// Check that the device was enrolled within the last 2 hours
 	if err := checkRecentEnrollment(device.LastEnrollment); err != nil {
@@ -270,6 +292,47 @@ func getDeviceFromIru(serialNumber string) (*IruDevice, error) {
 
 	// Return the first (and expected only) matching device
 	return &devices[0], nil
+}
+
+func getDeviceDetailsFromIru(deviceID string) (*IruDeviceDetails, error) {
+	iruURL := os.Getenv("IRU_API_URL")
+	iruTokenSecretName := os.Getenv("IRU_API_TOKEN_SECRET_NAME")
+
+	if iruURL == "" || iruTokenSecretName == "" {
+		return nil, fmt.Errorf("missing Iru API configuration")
+	}
+
+	iruToken, err := getSecretValue(iruTokenSecretName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to retrieve Iru API token from Secrets Manager: %w", err)
+	}
+
+	requestURL := fmt.Sprintf("%s/api/v1/devices/%s/details", iruURL, url.PathEscape(deviceID))
+
+	req, err := http.NewRequest("GET", requestURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Authorization", "Bearer "+iruToken)
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to call Iru details API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Iru details API returned status %d", resp.StatusCode)
+	}
+
+	var details IruDeviceDetails
+	if err := json.NewDecoder(resp.Body).Decode(&details); err != nil {
+		return nil, fmt.Errorf("failed to decode Iru details response: %w", err)
+	}
+
+	return &details, nil
 }
 
 func getTACFromOktaWorkflow(userEmail, serialNumber, deviceID string) (*WorkflowResult, error) {
